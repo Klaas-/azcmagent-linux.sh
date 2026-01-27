@@ -1,0 +1,16 @@
+name: Check new version
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 * * * *'
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - run: |
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          curl --fail -v -L https://aka.ms/azcmagent -o azcmagent-linux.sh || exit 1
+          if ! git diff --exit-code azcmagent-linux.sh; then git add azcmagent-linux.sh; export VERSION=$(TZ=UTC date --iso-8601=seconds); git commit -m "Version ${VERSION}"; git push; fi
+
