@@ -14,7 +14,6 @@ outfile=
 configfile=
 altdownloadfile=
 format_success=
-format_failure=
 desired_version=
 alt_his_endpoint=
 apt=0
@@ -54,12 +53,13 @@ function log_failure() {
     his_endpoint=https://gbl.his.arc.azure.us
   elif [ "${cloud}" = "AzureChinaCloud" ]; then
     his_endpoint=https://gbl.his.arc.azure.cn
-  elif [ "${cloud}" = "AzureStackCloud" ]; then
+  else
+    # Covers AzureStackCloud and other sovereign/isolated clouds that provide
+    # a custom HIS endpoint via the --althisendpoint flag.
     if [ -n "${alt_his_endpoint}" ]; then
         his_endpoint=${alt_his_endpoint}
     else
-        echo "error in log_failure due to invalid his endpoint."
-        return
+        echo "No HIS endpoint provided, using default gbl.his.arc.azure.com"
     fi
   fi
 
@@ -207,27 +207,20 @@ function resolveDesiredVersion {
 
             if [ $zypper -eq 1 ]; then
                 echo "Using Zypper package manager..."
-                available_versions=$(zypper --gpg-auto-import-keys --no-refresh se -s azcmagent 2>/dev/null | grep azcmagent | grep -v '^|' | awk '{for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+/) print $i}' | sort -V)
-                azcmagent_output=$(zypper --gpg-auto-import-keys --no-refresh se -s azcmagent 2>/dev/null)
-                test_output=$(zypper --gpg-auto-import-keys search -s azcmagent)
-                echo "test_output"
-                echo "$test_output"
-                echo "test_output"
-            
+                sudo zypper --gpg-auto-import-keys refresh 2>/dev/null || true
+                available_versions=$(zypper --gpg-auto-import-keys se -s azcmagent 2>/dev/null | grep azcmagent | grep -v '^|' | awk '{for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+/) print $i}' | sort -V)
+
             elif [ "$yum" = "yum" ]; then
                 echo "Using YUM package manager..."
-                available_versions=$(yum --showduplicates -y list azcmagent 2>/dev/null | grep azcmagent | awk '{print $2}' | sort -V)
-                azcmagent_output=$(yum --showduplicates -y list azcmagent 2>/dev/null)
+                available_versions=$(yum --setopt=skip_if_unavailable=True --showduplicates -y list azcmagent 2>/dev/null | grep azcmagent | awk '{print $2}' | sort -V)
 
             elif [ "$yum" = "dnf" ]; then
                 echo "Using DNF package manager..."
-                available_versions=$(dnf --showduplicates -y list azcmagent 2>/dev/null | grep azcmagent | awk '{print $2}' | sort -V)
-                azcmagent_output=$(dnf --showduplicates -y list azcmagent 2>/dev/null)
+                available_versions=$(dnf --setopt=skip_if_unavailable=True --showduplicates -y list azcmagent 2>/dev/null | grep azcmagent | awk '{print $2}' | sort -V)
 
             elif [ "$yum" = "tdnf" ]; then
                 echo "Using TDNF package manager..."
                 available_versions=$(tdnf -y list azcmagent 2>/dev/null | grep azcmagent | awk '{print $2}' | sort -V)
-                azcmagent_output=$(tdnf -y list azcmagent 2>/dev/null)
             fi
 
             matching_version=""
@@ -242,8 +235,6 @@ function resolveDesiredVersion {
                 echo "No matching version found for prefix $desired_version"
                 echo "Available versions:"
                 echo "$available_versions"
-                echo "azcmagent_output:"
-                echo "$azcmagent_output"
                 echo "exiting"
                 exit 1
             fi
@@ -487,6 +478,12 @@ case "${distro}" in
         elif [ "${distro_major_version}" -eq 15 ]; then
             echo "Configuring for SLES 15..."
             rpm_distro=sles/15
+        elif [ "${distro_major_version}" -eq 16 ]; then
+            if [ ${arm64} -eq 1 ]; then
+                exit_failure 133 "$0: ARM64 for SLES 16 is currently not supported. For supported OSs, see https://learn.microsoft.com/en-us/azure/azure-arc/servers/prerequisites#supported-operating-systems"            
+            fi
+            echo "Configuring for SLES 16..."
+            rpm_distro=sles/16
         else
             exit_failure 133 "$0: unsupported Linux distribution: ${distro}:${distro_major_version}.${distro_minor_version}. For supported OSs, see https://learn.microsoft.com/en-us/azure/azure-arc/servers/prerequisites#supported-operating-systems"
         fi
@@ -662,15 +659,21 @@ case "${distro}" in
 
     # Rocky Linux (uses RHEL repositories)
     *ocky*)
-        if [ ${arm64} -eq 1 ]; then
-            exit_failure 133 "$0: ARM64 for Rocky Linux is currently not supported. For supported OSs, see https://learn.microsoft.com/en-us/azure/azure-arc/servers/prerequisites#supported-operating-systems"            
-        fi
         if [ "${distro_major_version}" -eq 8 ]; then
+            if [ ${arm64} -eq 1 ]; then
+                exit_failure 133 "$0: ARM64 for Rocky Linux 8 is currently not supported. For supported OSs, see https://learn.microsoft.com/en-us/azure/azure-arc/servers/prerequisites#supported-operating-systems"            
+            fi
             echo "Configuring for Rocky Linux 8..."
             rpm_distro=rhel/8  # Use RHEL repository for Rocky Linux 8
         elif [ "${distro_major_version}" -eq 9 ]; then
+            if [ ${arm64} -eq 1 ]; then
+                exit_failure 133 "$0: ARM64 for Rocky Linux 9 is currently not supported. For supported OSs, see https://learn.microsoft.com/en-us/azure/azure-arc/servers/prerequisites#supported-operating-systems"            
+            fi
             echo "Configuring for Rocky Linux 9..."
             rpm_distro=rhel/9 # Use RHEL repository for Rocky Linux 9
+        elif [ "${distro_major_version}" -eq 10 ]; then
+            echo "Configuring for Rocky Linux 10..."
+            rpm_distro=rhel/10 # Use RHEL repository for Rocky Linux 10
         else
             exit_failure 133 "$0: unsupported Linux distribution: ${distro}:${distro_major_version}.${distro_minor_version}. For supported OSs, see https://learn.microsoft.com/en-us/azure/azure-arc/servers/prerequisites#supported-operating-systems"
         fi
@@ -697,6 +700,9 @@ case "${distro}" in
             fi
             echo "Configuring for Alma Linux 9..."
             rpm_distro=rhel/9 # Use RHEL repository for AlmaLinux 9
+        elif [ "${distro_major_version}" -eq 10 ]; then
+            echo "Configuring for Alma Linux 10..."
+            rpm_distro=rhel/10  # Use RHEL repository for AlmaLinux 10
         else
             exit_failure 133 "$0: unsupported Linux distribution: ${distro}:${distro_major_version}.${distro_minor_version}. For supported OSs, see https://learn.microsoft.com/en-us/azure/azure-arc/servers/prerequisites#supported-operating-systems"
         fi
@@ -910,16 +916,23 @@ else
                 exit_failure 147 "$0: desired_version not found: $desired_version"
             fi
             if [ -n "${proxy}" ]; then
-                sudo -E https_proxy=${proxy} ${yum} -y install azcmagent-${desired_version}
+                sudo -E https_proxy=${proxy} ${yum} --setopt=skip_if_unavailable=True -y install azcmagent-${desired_version}
             else
-                sudo -E ${yum} -y install azcmagent-${desired_version}
+                sudo -E ${yum} --setopt=skip_if_unavailable=True -y install azcmagent-${desired_version}
             fi
         else
             # Installing the latest available version of azcmagent package
             if [ -n "${proxy}" ]; then
-                sudo -E https_proxy=${proxy} ${yum} -y install azcmagent
+                sudo -E https_proxy=${proxy} ${yum} --setopt=skip_if_unavailable=True -y install azcmagent
             else
-                sudo -E ${yum} -y install azcmagent
+                sudo -E ${yum} --setopt=skip_if_unavailable=True -y install azcmagent
+            fi
+            # Also run upgrade in case azcmagent is already installed at an older version,
+            # since install won't upgrade an already-installed package
+            if [ -n "${proxy}" ]; then
+                sudo -E https_proxy=${proxy} ${yum} --setopt=skip_if_unavailable=True -y upgrade azcmagent
+            else
+                sudo -E ${yum} --setopt=skip_if_unavailable=True -y upgrade azcmagent
             fi
         fi
     fi
