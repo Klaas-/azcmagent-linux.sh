@@ -29,6 +29,7 @@ use_wget=0
 install_curl=0
 arm64=0
 noproxy=0
+forceupgrade=0
 
 # Commands that involve pipes will have return value of '0' only if all parts execute successfully
 set -o pipefail 
@@ -207,20 +208,41 @@ function resolveDesiredVersion {
 
             if [ $zypper -eq 1 ]; then
                 echo "Using Zypper package manager..."
-                sudo zypper --gpg-auto-import-keys refresh 2>/dev/null || true
-                available_versions=$(zypper --gpg-auto-import-keys se -s azcmagent 2>/dev/null | grep azcmagent | grep -v '^|' | awk '{for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+/) print $i}' | sort -V)
+                if [ -n "${proxy}" ]; then
+                    sudo -E https_proxy=${proxy} zypper --gpg-auto-import-keys refresh --repo "Microsoft Production" 2>/dev/null || true
+                else
+                    sudo zypper --gpg-auto-import-keys refresh --repo "Microsoft Production" 2>/dev/null || true
+                fi
+                # Use --no-refresh to avoid refreshing SUSE subscription repos (may have invalid credentials on test VMs)
+                if [ -n "${proxy}" ]; then
+                    available_versions=$(sudo -E https_proxy=${proxy} zypper --no-refresh --gpg-auto-import-keys se -s azcmagent 2>/dev/null | grep azcmagent | grep -v '^|' | awk '{for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+/) print $i}' | sort -V)
+                else
+                    available_versions=$(zypper --no-refresh --gpg-auto-import-keys se -s azcmagent 2>/dev/null | grep azcmagent | grep -v '^|' | awk '{for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+/) print $i}' | sort -V)
+                fi
 
             elif [ "$yum" = "yum" ]; then
                 echo "Using YUM package manager..."
-                available_versions=$(yum --setopt=skip_if_unavailable=True --showduplicates -y list azcmagent 2>/dev/null | grep azcmagent | awk '{print $2}' | sort -V)
+                if [ -n "${proxy}" ]; then
+                    available_versions=$(sudo -E https_proxy=${proxy} yum --setopt=skip_if_unavailable=True --showduplicates -y list azcmagent 2>/dev/null | grep azcmagent | awk '{print $2}' | sort -V)
+                else
+                    available_versions=$(yum  --setopt=skip_if_unavailable=True --showduplicates -y list azcmagent 2>/dev/null | grep azcmagent | awk '{print $2}' | sort -V)
+                fi
 
             elif [ "$yum" = "dnf" ]; then
                 echo "Using DNF package manager..."
-                available_versions=$(dnf --setopt=skip_if_unavailable=True --showduplicates -y list azcmagent 2>/dev/null | grep azcmagent | awk '{print $2}' | sort -V)
+                if [ -n "${proxy}" ]; then
+                    available_versions=$(sudo -E https_proxy=${proxy} dnf  --setopt=skip_if_unavailable=True --showduplicates -y list azcmagent 2>/dev/null | grep azcmagent | awk '{print $2}' | sort -V)
+                else
+                    available_versions=$(dnf --setopt=skip_if_unavailable=True --showduplicates -y list azcmagent 2>/dev/null | grep azcmagent | awk '{print $2}' | sort -V)
+                fi
 
             elif [ "$yum" = "tdnf" ]; then
                 echo "Using TDNF package manager..."
-                available_versions=$(tdnf -y list azcmagent 2>/dev/null | grep azcmagent | awk '{print $2}' | sort -V)
+                if [ -n "${proxy}" ]; then
+                    available_versions=$(sudo -E https_proxy=${proxy} tdnf -y list azcmagent 2>/dev/null | grep azcmagent | awk '{print $2}' | sort -V)
+                else
+                    available_versions=$(tdnf -y list azcmagent 2>/dev/null | grep azcmagent | awk '{print $2}' | sort -V)
+                fi
             fi
 
             matching_version=""
@@ -289,6 +311,10 @@ case "$key" in
     -e|--althisendpoint)
 	alt_his_endpoint="$2"
 	shift
+	shift
+	;;
+    --forceupgrade)
+	forceupgrade=1
 	shift
 	;;
     -h|--help)
@@ -796,18 +822,22 @@ if [ $apt -eq 1 ]; then
         # Install from local .deb file
 	    sudo -E DEBIAN_FRONTEND=noninteractive apt install "${tempdir}/azcmagent.deb"
     else
-        # Install from Microsoft repository - clean up previous configuration first
-        sudo apt -y remove packages-microsoft-prod || true
-        # Download and install Microsoft repository configuration package
-        download_ret=$(download_file https://packages.microsoft.com/config/${deb_distro}/packages-microsoft-prod.deb "${tempdir}/packages-microsoft-prod.deb")
-        if [ $download_ret -ne 0 ]; then
-            if [ $download_ret -eq 23 -a ${use_curl} -eq 1 ]; then
-                exit_failure 157 "$0: curl permission error"
+        # Configure Microsoft repository only when missing.
+        if ! dpkg -s packages-microsoft-prod >/dev/null 2>&1; then
+             # Install from Microsoft repository - clean up previous configuration first
+            sudo apt -y remove packages-microsoft-prod || true
+            # Download and install Microsoft repository configuration package
+            download_ret=$(download_file https://packages.microsoft.com/config/${deb_distro}/packages-microsoft-prod.deb "${tempdir}/packages-microsoft-prod.deb")
+            if [ $download_ret -ne 0 ]; then
+                if [ $download_ret -eq 23 -a ${use_curl} -eq 1 ]; then
+                    exit_failure 157 "$0: curl permission error"
+                fi
+                exit_failure 146 "$0: download of https://packages.microsoft.com/config/${deb_distro}/packages-microsoft-prod.deb errored"
             fi
-            exit_failure 146 "$0: download of https://packages.microsoft.com/config/${deb_distro}/packages-microsoft-prod.deb errored"
+            # Install repository configuration package
+            sudo -E dpkg -i "${tempdir}/packages-microsoft-prod.deb"
         fi
-        # Install repository configuration package
-        sudo -E dpkg -i "${tempdir}/packages-microsoft-prod.deb"
+       
         # Update package lists to include Microsoft repository
         if [ -n "${proxy}" ]; then
             sudo -E https_proxy=${proxy} apt-get update
@@ -844,38 +874,49 @@ elif [ $zypper -eq 1 ]; then
         # Install from local .rpm file
 	    sudo -E zypper install -y "${tempdir}/azcmagent.rpm"
     else
-        # Install from Microsoft repository - clean up previous configuration first
-        sudo zypper remove -y packages-microsoft-prod || true
-        # Download and install Microsoft repository configuration package
-        download_ret=$(download_file https://packages.microsoft.com/config/${rpm_distro}/packages-microsoft-prod.rpm "${tempdir}/packages-microsoft-prod.rpm")
-        if [ $download_ret -ne 0 ]; then
-            if [ $download_ret -eq 23 -a ${use_curl} -eq 1 ]; then
-                exit_failure 157 "$0: curl permission error"
+    
+        # Configure Microsoft repository only when missing.
+        if ! rpm -q packages-microsoft-prod >/dev/null 2>&1; then
+            # Install from Microsoft repository - clean up previous configuration first
+            sudo zypper remove -y packages-microsoft-prod || true
+            # Download and install Microsoft repository configuration package
+            download_ret=$(download_file https://packages.microsoft.com/config/${rpm_distro}/packages-microsoft-prod.rpm "${tempdir}/packages-microsoft-prod.rpm")
+            if [ $download_ret -ne 0 ]; then
+                if [ $download_ret -eq 23 -a ${use_curl} -eq 1 ]; then
+                    exit_failure 157 "$0: curl permission error"
+                fi
+                exit_failure 146 "$0: download of https://packages.microsoft.com/config/${rpm_distro}/packages-microsoft-prod.rpm errored"
             fi
-            exit_failure 146 "$0: download of https://packages.microsoft.com/config/${rpm_distro}/packages-microsoft-prod.rpm errored"
+            # Install repository configuration package
+            sudo -E rpm -i "${tempdir}/packages-microsoft-prod.rpm"
         fi
-        # Install repository configuration package
-        sudo -E rpm -i "${tempdir}/packages-microsoft-prod.rpm"
+        
+        # Refresh zypper metadata so the new PMC repo is available for version resolution
+        if [ -n "${proxy}" ]; then
+            sudo -E https_proxy=${proxy} zypper --gpg-auto-import-keys refresh --repo "Microsoft Production" || true
+        else
+            sudo zypper --gpg-auto-import-keys refresh --repo "Microsoft Production" || true
+        fi
         # Convert partial version to full version if needed
         resolveDesiredVersion
         # Install azcmagent package
         if [ -n "${desired_version}" ]; then
             # Installing specific version of azcmagent package
             # Verify the desired version is available in the repository
-            if ! [ -n "$(zypper --gpg-auto-import-keys search -s azcmagent | grep ${desired_version})" ]; then
+            if ! [ -n "$(zypper --no-refresh --gpg-auto-import-keys search -s azcmagent 2>/dev/null | grep ${desired_version})" ]; then
                 exit_failure 147 "$0: desired_version not found: $desired_version"
             fi
             if [ -n "${proxy}" ]; then
-                sudo -E https_proxy=${proxy} zypper --gpg-auto-import-keys --non-interactive install -y -l azcmagent=${desired_version}
+                sudo -E https_proxy=${proxy} zypper --no-refresh --gpg-auto-import-keys --non-interactive install -y -l azcmagent=${desired_version}
             else
-                sudo -E zypper --gpg-auto-import-keys --non-interactive install -y -l azcmagent=${desired_version}
+                sudo -E zypper --no-refresh --gpg-auto-import-keys --non-interactive install -y -l azcmagent=${desired_version}
             fi
         else
             # Installing the latest available version of azcmagent package
             if [ -n "${proxy}" ]; then
-                sudo -E https_proxy=${proxy} zypper --gpg-auto-import-keys --non-interactive install -y -l azcmagent
+                sudo -E https_proxy=${proxy} zypper --no-refresh --gpg-auto-import-keys --non-interactive install -y -l azcmagent
             else
-                sudo -E zypper -vv --gpg-auto-import-keys --non-interactive install -y -l azcmagent
+                sudo -E zypper --no-refresh -vv --gpg-auto-import-keys --non-interactive install -y -l azcmagent
             fi
         fi
     fi
@@ -893,18 +934,20 @@ else
     else
         if [ -n "${rpm_distro}" ]; then
             # Install from Microsoft repository - clean up previous configuration first
-            sudo ${yum} -y remove packages-microsoft-prod || true
+            if ! rpm -q packages-microsoft-prod >/dev/null 2>&1; then
+                sudo ${yum} -y remove packages-microsoft-prod || true
 
-            # Download and install Microsoft repository configuration package
-            download_ret=$(download_file https://packages.microsoft.com/config/${rpm_distro}/packages-microsoft-prod.rpm "${tempdir}/packages-microsoft-prod.rpm")
-            if [ $download_ret -ne 0 ]; then
-                if [ $download_ret -eq 23 -a ${use_curl} -eq 1 ]; then
-                    exit_failure 157 "$0: curl permission error"
+                # Download and install Microsoft repository configuration package
+                download_ret=$(download_file https://packages.microsoft.com/config/${rpm_distro}/packages-microsoft-prod.rpm "${tempdir}/packages-microsoft-prod.rpm")
+                if [ $download_ret -ne 0 ]; then
+                    if [ $download_ret -eq 23 -a ${use_curl} -eq 1 ]; then
+                        exit_failure 157 "$0: curl permission error"
+                    fi
+                    exit_failure 146 "$0: download of https://packages.microsoft.com/config/${rpm_distro}/packages-microsoft-prod.rpm errored"
                 fi
-                exit_failure 146 "$0: download of https://packages.microsoft.com/config/${rpm_distro}/packages-microsoft-prod.rpm errored"
-            fi
-            # Install repository configuration package
-            sudo -E rpm -i "${tempdir}/packages-microsoft-prod.rpm"
+                # Install repository configuration package
+                sudo -E rpm -i "${tempdir}/packages-microsoft-prod.rpm"
+            fi           
         fi
         # Convert partial version to full version if needed
         resolveDesiredVersion
@@ -912,25 +955,33 @@ else
         if [ -n "${desired_version}" ]; then
             # Installing specific version of azcmagent package
             # Verify the desired version is available in the repository
-            if ! [ -n "$(${yum} --showduplicates list available azcmagent | grep ${desired_version})" ]; then
+            if [ -n "${proxy}" ]; then
+                desired_version_match=$(sudo -E https_proxy="${proxy}" ${yum} --setopt=skip_if_unavailable=True --showduplicates list available azcmagent | grep -F -- "${desired_version}")
+            else
+                desired_version_match=$(${yum} --setopt=skip_if_unavailable=True --showduplicates list available azcmagent | grep -F -- "${desired_version}")
+            fi
+            if ! [ -n "${desired_version_match}" ]; then
                 exit_failure 147 "$0: desired_version not found: $desired_version"
             fi
             if [ -n "${proxy}" ]; then
-                sudo -E https_proxy=${proxy} ${yum} --setopt=skip_if_unavailable=True -y install azcmagent-${desired_version}
+                sudo -E https_proxy="${proxy}" ${yum} --setopt=skip_if_unavailable=True -y install azcmagent-${desired_version}
             else
                 sudo -E ${yum} --setopt=skip_if_unavailable=True -y install azcmagent-${desired_version}
             fi
         else
             # Installing the latest available version of azcmagent package
             if [ -n "${proxy}" ]; then
-                sudo -E https_proxy=${proxy} ${yum} --setopt=skip_if_unavailable=True -y install azcmagent
+                sudo -E https_proxy="${proxy}" ${yum} --setopt=skip_if_unavailable=True -y install azcmagent
             else
                 sudo -E ${yum} --setopt=skip_if_unavailable=True -y install azcmagent
             fi
-            # Also run upgrade in case azcmagent is already installed at an older version,
-            # since install won't upgrade an already-installed package
+        fi
+        # rpm-based package managers (yum/dnf/tdnf) won't replace binaries if the package is
+        # already installed at a different version unless 'upgrade' is also run.
+        # Callers that need this behavior (e.g. azcmagent upgrade) pass --forceupgrade.
+        if [ $forceupgrade -eq 1 ]; then
             if [ -n "${proxy}" ]; then
-                sudo -E https_proxy=${proxy} ${yum} --setopt=skip_if_unavailable=True -y upgrade azcmagent
+                sudo -E https_proxy="${proxy}" ${yum} --setopt=skip_if_unavailable=True -y upgrade azcmagent
             else
                 sudo -E ${yum} --setopt=skip_if_unavailable=True -y upgrade azcmagent
             fi
